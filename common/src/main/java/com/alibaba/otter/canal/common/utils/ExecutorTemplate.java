@@ -34,7 +34,7 @@ public class ExecutorTemplate {
     private volatile List<Future>       futures  = null;
 
     public ExecutorTemplate(ThreadPoolExecutor executor){
-        this.futures = Collections.synchronizedList(new ArrayList<Future>());
+        this.futures = Collections.synchronizedList(new ArrayList<>());
         this.executor = executor;
     }
 
@@ -44,7 +44,7 @@ public class ExecutorTemplate {
         check(future);
     }
 
-    public void submit(Callable<Exception> task) {
+    public void submit(Callable task) {
         Future future = executor.submit(task);
         futures.add(future);
         check(future);

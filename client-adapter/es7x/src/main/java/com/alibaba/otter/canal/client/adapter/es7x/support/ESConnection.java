@@ -2,7 +2,10 @@ package com.alibaba.otter.canal.client.adapter.es7x.support;
 
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.UnknownHostException;
+import java.util.Arrays;
 import java.util.Map;
 
 import org.apache.commons.lang.StringUtils;
@@ -52,16 +55,9 @@ import com.alibaba.otter.canal.client.adapter.es.core.support.ESBulkRequest;
 public class ESConnection {
 
     private static final Logger logger = LoggerFactory.getLogger(ESConnection.class);
-
-    public enum ESClientMode {
-        TRANSPORT, REST
-    }
-
     private ESClientMode        mode;
-
     @SuppressWarnings("deprecation")
     private TransportClient     transportClient;
-
     private RestHighLevelClient restHighLevelClient;
 
     public ESConnection(String[] hosts, Map<String, String> properties, ESClientMode mode) throws UnknownHostException{
@@ -77,22 +73,16 @@ public class ESConnection {
                     Integer.parseInt(host.substring(i + 1))));
             }
         } else {
-            HttpHost[] httpHosts = new HttpHost[hosts.length];
-            for (int i = 0; i < hosts.length; i++) {
-                String host = hosts[i];
-                int j = host.indexOf(":");
-                HttpHost httpHost = new HttpHost(InetAddress.getByName(host.substring(0, j)),
-                    Integer.parseInt(host.substring(j + 1)));
-                httpHosts[i] = httpHost;
-            }
+            HttpHost[] httpHosts = Arrays.stream(hosts).map(this::createHttpHost).toArray(HttpHost[]::new);
             RestClientBuilder restClientBuilder = RestClient.builder(httpHosts);
             String nameAndPwd = properties.get("security.auth");
             if (StringUtils.isNotEmpty(nameAndPwd) && nameAndPwd.contains(":")) {
                 String[] nameAndPwdArr = nameAndPwd.split(":");
                 final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
-                credentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(nameAndPwdArr[0],
-                    nameAndPwdArr[1]));
-                restClientBuilder.setHttpClientConfigCallback(httpClientBuilder -> httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider));
+                credentialsProvider.setCredentials(AuthScope.ANY,
+                    new UsernamePasswordCredentials(nameAndPwdArr[0], nameAndPwdArr[1]));
+                restClientBuilder.setHttpClientConfigCallback(
+                    httpClientBuilder -> httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider));
             }
             restHighLevelClient = new RestHighLevelClient(restClientBuilder);
         }
@@ -145,6 +135,78 @@ public class ESConnection {
             mappingMetaData = mappings.get(index);
         }
         return mappingMetaData;
+    }
+
+    // ------ get/set ------
+    public ESClientMode getMode() {
+        return mode;
+    }
+
+    public void setMode(ESClientMode mode) {
+        this.mode = mode;
+    }
+
+    public TransportClient getTransportClient() {
+        return transportClient;
+    }
+
+    public void setTransportClient(TransportClient transportClient) {
+        this.transportClient = transportClient;
+    }
+
+    public RestHighLevelClient getRestHighLevelClient() {
+        return restHighLevelClient;
+    }
+
+    public void setRestHighLevelClient(RestHighLevelClient restHighLevelClient) {
+        this.restHighLevelClient = restHighLevelClient;
+    }
+
+    private HttpHost createHttpHost(String uriStr) {
+        URI uri = URI.create(uriStr);
+        if (!org.springframework.util.StringUtils.hasLength(uri.getUserInfo())) {
+            return HttpHost.create(uri.toString());
+        }
+        try {
+            return HttpHost.create(new URI(uri
+                .getScheme(), null, uri.getHost(), uri.getPort(), uri.getPath(), uri.getQuery(), uri.getFragment())
+                    .toString());
+        } catch (URISyntaxException ex) {
+            throw new IllegalStateException(ex);
+        }
+    }
+
+    public enum ESClientMode {
+                              TRANSPORT, REST
+    }
+
+    public static class ES7xBulkResponse implements ESBulkRequest.ESBulkResponse {
+
+        private BulkResponse bulkResponse;
+
+        public ES7xBulkResponse(BulkResponse bulkResponse){
+            this.bulkResponse = bulkResponse;
+        }
+
+        @Override
+        public boolean hasFailures() {
+            return bulkResponse.hasFailures();
+        }
+
+        @Override
+        public void processFailBulkResponse(String errorMsg) {
+            for (BulkItemResponse itemResponse : bulkResponse.getItems()) {
+                if (!itemResponse.isFailed()) {
+                    continue;
+                }
+
+                if (itemResponse.getFailure().getStatus() == RestStatus.NOT_FOUND) {
+                    logger.error(itemResponse.getFailureMessage());
+                } else {
+                    throw new RuntimeException(errorMsg + itemResponse.getFailureMessage());
+                }
+            }
+        }
     }
 
     public class ES7xIndexRequest implements ESBulkRequest.ESIndexRequest {
@@ -446,59 +508,5 @@ public class ESConnection {
         public void setBulkRequest(BulkRequest bulkRequest) {
             this.bulkRequest = bulkRequest;
         }
-    }
-
-    public static class ES7xBulkResponse implements ESBulkRequest.ESBulkResponse {
-
-        private BulkResponse bulkResponse;
-
-        public ES7xBulkResponse(BulkResponse bulkResponse){
-            this.bulkResponse = bulkResponse;
-        }
-
-        @Override
-        public boolean hasFailures() {
-            return bulkResponse.hasFailures();
-        }
-
-        @Override
-        public void processFailBulkResponse(String errorMsg) {
-            for (BulkItemResponse itemResponse : bulkResponse.getItems()) {
-                if (!itemResponse.isFailed()) {
-                    continue;
-                }
-
-                if (itemResponse.getFailure().getStatus() == RestStatus.NOT_FOUND) {
-                    logger.error(itemResponse.getFailureMessage());
-                } else {
-                    throw new RuntimeException(errorMsg + itemResponse.getFailureMessage());
-                }
-            }
-        }
-    }
-
-    // ------ get/set ------
-    public ESClientMode getMode() {
-        return mode;
-    }
-
-    public void setMode(ESClientMode mode) {
-        this.mode = mode;
-    }
-
-    public TransportClient getTransportClient() {
-        return transportClient;
-    }
-
-    public void setTransportClient(TransportClient transportClient) {
-        this.transportClient = transportClient;
-    }
-
-    public RestHighLevelClient getRestHighLevelClient() {
-        return restHighLevelClient;
-    }
-
-    public void setRestHighLevelClient(RestHighLevelClient restHighLevelClient) {
-        this.restHighLevelClient = restHighLevelClient;
     }
 }

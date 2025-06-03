@@ -8,13 +8,13 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Pattern;
-
+import com.alibaba.otter.canal.parse.driver.mysql.packets.server.FieldPacket;
+import com.alibaba.polardbx.druid.sql.repository.Schema;
 import org.apache.commons.beanutils.BeanUtils;
 import org.apache.commons.lang.ObjectUtils;
 import org.apache.commons.lang.StringUtils;
@@ -22,10 +22,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
-import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.JSONObject;
-import com.alibaba.fastsql.sql.repository.Schema;
+import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONObject;
+import com.alibaba.fastjson2.JSONWriter;
 import com.alibaba.otter.canal.filter.CanalEventFilter;
+import com.alibaba.otter.canal.parse.driver.mysql.packets.server.FieldPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.server.ResultSetPacket;
 import com.alibaba.otter.canal.parse.exception.CanalParseException;
 import com.alibaba.otter.canal.parse.inbound.TableMeta;
@@ -52,15 +53,11 @@ public class DatabaseTableMeta implements TableMetaTSDB {
     private static Logger                   logger              = LoggerFactory.getLogger(DatabaseTableMeta.class);
     private static Pattern                  pattern             = Pattern.compile("Duplicate entry '.*' for key '*'");
     private static Pattern                  h2Pattern           = Pattern.compile("Unique index or primary key violation");
-    private static ScheduledExecutorService scheduler           = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
-
-                                                                    @Override
-                                                                    public Thread newThread(Runnable r) {
-                                                                        Thread thread = new Thread(r,
-                                                                            "[scheduler-table-meta-snapshot]");
-                                                                        thread.setDaemon(true);
-                                                                        return thread;
-                                                                    }
+    private static ScheduledExecutorService scheduler           = Executors.newSingleThreadScheduledExecutor(r -> {
+                                                                    Thread thread = new Thread(r,
+                                                                        "[scheduler-table-meta-snapshot]");
+                                                                    thread.setDaemon(true);
+                                                                    return thread;
                                                                 });
     private ReadWriteLock                   lock                = new ReentrantReadWriteLock();
     private AtomicBoolean                   initialized         = new AtomicBoolean(false);
@@ -69,8 +66,8 @@ public class DatabaseTableMeta implements TableMetaTSDB {
     private volatile MysqlConnection        connection;                                                                    // 查询meta信息的链接
     private CanalEventFilter                filter;
     private CanalEventFilter                blackFilter;
-    private Map<String, List<String>>       fieldFilterMap      = new HashMap<String, List<String>>();
-    private Map<String, List<String>>       fieldBlackFilterMap = new HashMap<String, List<String>>();
+    private Map<String, List<String>>       fieldFilterMap      = new HashMap<>();
+    private Map<String, List<String>>       fieldBlackFilterMap = new HashMap<>();
     private EntryPosition                   lastPosition;
     private boolean                         hasNewDdl;
     private MetaHistoryDAO                  metaHistoryDAO;
@@ -91,26 +88,22 @@ public class DatabaseTableMeta implements TableMetaTSDB {
 
             // 24小时生成一份snapshot
             if (snapshotInterval > 0) {
-                scheduleSnapshotFuture = scheduler.scheduleWithFixedDelay(new Runnable() {
+                scheduleSnapshotFuture = scheduler.scheduleWithFixedDelay(() -> {
+                    boolean applyResult = false;
+                    try {
+                        MDC.put("destination", destination);
+                        applyResult = applySnapshotToDB(lastPosition, false);
+                    } catch (Throwable e) {
+                        logger.error("scheudle applySnapshotToDB faield", e);
+                    }
 
-                    @Override
-                    public void run() {
-                        boolean applyResult = false;
-                        try {
-                            MDC.put("destination", destination);
-                            applyResult = applySnapshotToDB(lastPosition, false);
-                        } catch (Throwable e) {
-                            logger.error("scheudle applySnapshotToDB faield", e);
+                    try {
+                        MDC.put("destination", destination);
+                        if (applyResult) {
+                            snapshotExpire((int) TimeUnit.HOURS.toSeconds(snapshotExpire));
                         }
-
-                        try {
-                            MDC.put("destination", destination);
-                            if (applyResult) {
-                                snapshotExpire((int) TimeUnit.HOURS.toSeconds(snapshotExpire));
-                            }
-                        } catch (Throwable e) {
-                            logger.error("scheudle snapshotExpire faield", e);
-                        }
+                    } catch (Throwable e) {
+                        logger.error("scheudle snapshotExpire faield", e);
                     }
                 }, snapshotInterval, snapshotInterval, TimeUnit.HOURS);
             }
@@ -199,19 +192,34 @@ public class DatabaseTableMeta implements TableMetaTSDB {
     private boolean dumpTableMeta(MysqlConnection connection, final CanalEventFilter filter) {
         try {
             ResultSetPacket packet = connection.query("show databases");
-            List<String> schemas = new ArrayList<String>();
-            for (String schema : packet.getFieldValues()) {
+            int columnSize = packet.getFieldDescriptors().size();
+            int columnIndex = 0;
+            for (; columnIndex < columnSize; columnIndex++) {
+                FieldPacket value = packet.getFieldDescriptors().get(columnIndex);
+                if (StringUtils.equalsIgnoreCase(value.getName(), "Database")) {
+                    break;
+                }
+            }
+
+            List<String> schemas = new ArrayList<>();
+            for (int line = 0; line < packet.getFieldValues().size() / columnSize; line++) {
+                String schema = packet.getFieldValues().get(line * columnSize + columnIndex);
                 schemas.add(schema);
             }
 
             for (String schema : schemas) {
+                // 如果schema命中黑名单，直接跳过
+                // 解决部分数据库可以看到database，但实际表级别无权限的情况
+                if (blackFilter != null && blackFilter.filter(schema + ".%")) {
+                    continue;
+                }
                 // filter views
                 packet = connection.query("show full tables from `" + schema + "` where Table_type = 'BASE TABLE'");
-                List<String> tables = new ArrayList<String>();
-                for (String table : packet.getFieldValues()) {
-                    if ("BASE TABLE".equalsIgnoreCase(table)) {
-                        continue;
-                    }
+                columnSize = packet.getFieldDescriptors().size();
+                int tableNameColumnIndex = 0; // default index is 0
+                List<String> tables = new ArrayList<>();
+                for (int line = 0; line < packet.getFieldValues().size() / columnSize; line++) {
+                    String table = packet.getFieldValues().get(line * columnSize + tableNameColumnIndex);
                     String fullName = schema + "." + table;
                     if (blackFilter == null || !blackFilter.filter(fullName)) {
                         if (filter == null || filter.filter(fullName)) {
@@ -226,7 +234,7 @@ public class DatabaseTableMeta implements TableMetaTSDB {
 
                 StringBuilder sql = new StringBuilder();
                 for (String table : tables) {
-                    sql.append("show create table `" + schema + "`.`" + table + "`;");
+                    sql.append("show create table `" + schema + "`.`" + StringUtils.replace(table,"`","``") + "`;");
                 }
 
                 List<ResultSetPacket> packets = connection.queryMulti(sql.toString());
@@ -245,30 +253,47 @@ public class DatabaseTableMeta implements TableMetaTSDB {
     }
 
     private boolean applyHistoryToDB(EntryPosition position, String schema, String ddl, String extra) {
-        Map<String, String> content = new HashMap<String, String>();
-        content.put("destination", destination);
-        content.put("binlogFile", position.getJournalName());
-        content.put("binlogOffest", String.valueOf(position.getPosition()));
-        content.put("binlogMasterId", String.valueOf(position.getServerId()));
-        content.put("binlogTimestamp", String.valueOf(position.getTimestamp()));
-        content.put("useSchema", schema);
-        if (content.isEmpty()) {
-            throw new RuntimeException("apply failed caused by content is empty in applyHistoryToDB");
-        }
-        // 待补充
+        // Map<String, String> content = new HashMap<>();
+        // content.put("destination", destination);
+        // content.put("binlogFile", position.getJournalName());
+        // content.put("binlogOffest", String.valueOf(position.getPosition()));
+        // content.put("binlogMasterId", String.valueOf(position.getServerId()));
+        // content.put("binlogTimestamp", String.valueOf(position.getTimestamp()));
+        // content.put("useSchema", schema);
+        //
+        // if (content.isEmpty()) {
+        // throw new RuntimeException("apply failed caused by content is empty in
+        // applyHistoryToDB");
+        // }
+        // // 待补充
+        // List<DdlResult> ddlResults = DruidDdlParser.parse(ddl, schema);
+        // if (ddlResults.size() > 0) {
+        // DdlResult ddlResult = ddlResults.get(0);
+        // content.put("sqlSchema", ddlResult.getSchemaName());
+        // content.put("sqlTable", ddlResult.getTableName());
+        // content.put("sqlType", ddlResult.getType().name());
+        // content.put("sqlText", ddl);
+        // content.put("extra", extra);
+        // }
+        // BeanUtils.populate(metaDO, content);
+
+        MetaHistoryDO metaDO = new MetaHistoryDO();
+        metaDO.setDestination(destination);
+        metaDO.setBinlogFile(position.getJournalName());
+        metaDO.setBinlogOffest(position.getPosition());
+        metaDO.setBinlogMasterId(String.valueOf(position.getServerId()));
+        metaDO.setBinlogTimestamp(position.getTimestamp());
+        metaDO.setUseSchema(schema);
         List<DdlResult> ddlResults = DruidDdlParser.parse(ddl, schema);
         if (ddlResults.size() > 0) {
             DdlResult ddlResult = ddlResults.get(0);
-            content.put("sqlSchema", ddlResult.getSchemaName());
-            content.put("sqlTable", ddlResult.getTableName());
-            content.put("sqlType", ddlResult.getType().name());
-            content.put("sqlText", ddl);
-            content.put("extra", extra);
+            metaDO.setSqlSchema(ddlResult.getSchemaName());
+            metaDO.setSqlTable(ddlResult.getTableName());
+            metaDO.setSqlType(ddlResult.getType().name());
+            metaDO.setSqlText(ddl);
+            metaDO.setExtra(extra);
         }
-
-        MetaHistoryDO metaDO = new MetaHistoryDO();
         try {
-            BeanUtils.populate(metaDO, content);
             // 会建立唯一约束,解决:
             // 1. 重复的binlog file+offest
             // 2. 重复的masterId+timestamp
@@ -312,7 +337,7 @@ public class DatabaseTableMeta implements TableMetaTSDB {
         boolean compareAll = true;
         for (Schema schema : tmpMemoryTableMeta.getRepository().getSchemas()) {
             for (String table : schema.showTables()) {
-                String fullName = schema + "." + table;
+                String fullName = schema.getName() + "." + table;
                 if (blackFilter == null || !blackFilter.filter(fullName)) {
                     if (filter == null || filter.filter(fullName)) {
                         // issue : https://github.com/alibaba/canal/issues/1168
@@ -326,20 +351,27 @@ public class DatabaseTableMeta implements TableMetaTSDB {
         }
 
         if (compareAll) {
-            Map<String, String> content = new HashMap<String, String>();
-            content.put("destination", destination);
-            content.put("binlogFile", position.getJournalName());
-            content.put("binlogOffest", String.valueOf(position.getPosition()));
-            content.put("binlogMasterId", String.valueOf(position.getServerId()));
-            content.put("binlogTimestamp", String.valueOf(position.getTimestamp()));
-            content.put("data", JSON.toJSONString(schemaDdls));
-            if (content.isEmpty()) {
-                throw new RuntimeException("apply failed caused by content is empty in applySnapshotToDB");
-            }
+            // Map<String, String> content = new HashMap<>();
+            // content.put("destination", destination);
+            // content.put("binlogFile", position.getJournalName());
+            // content.put("binlogOffest", String.valueOf(position.getPosition()));
+            // content.put("binlogMasterId", String.valueOf(position.getServerId()));
+            // content.put("binlogTimestamp", String.valueOf(position.getTimestamp()));
+            // content.put("data", JSON.toJSONString(schemaDdls));
+            // if (content.isEmpty()) {
+            // throw new RuntimeException("apply failed caused by content is empty in
+            // applySnapshotToDB");
+            // }
+            // BeanUtils.populate(snapshotDO, content);
 
             MetaSnapshotDO snapshotDO = new MetaSnapshotDO();
+            snapshotDO.setDestination(destination);
+            snapshotDO.setBinlogFile(position.getJournalName());
+            snapshotDO.setBinlogOffest(position.getPosition());
+            snapshotDO.setBinlogMasterId(String.valueOf(position.getServerId()));
+            snapshotDO.setBinlogTimestamp(position.getTimestamp());
+            snapshotDO.setData(JSON.toJSONString(schemaDdls,JSONWriter.Feature.LargeObject));
             try {
-                BeanUtils.populate(snapshotDO, content);
                 metaSnapshotDAO.insert(snapshotDO);
             } catch (Throwable e) {
                 if (isUkDuplicateException(e)) {
@@ -456,7 +488,7 @@ public class DatabaseTableMeta implements TableMetaTSDB {
                 // 如果是同一秒内,对比一下history的位点，如果比期望的位点要大，忽略之
                 if (snapshotPosition.getTimestamp() > rollbackPosition.getTimestamp()) {
                     continue;
-                } else if (rollbackPosition.getServerId() == snapshotPosition.getServerId()
+                } else if (rollbackPosition.getServerId().equals(snapshotPosition.getServerId())
                            && snapshotPosition.compareTo(rollbackPosition) > 0) {
                     continue;
                 }
@@ -474,16 +506,16 @@ public class DatabaseTableMeta implements TableMetaTSDB {
         }
     }
 
+    private String structureSchema(String schema) {
+        if (schema.startsWith("`") && schema.endsWith("`")) {
+            return schema;
+        }
+        return "`" + schema + "`";
+    }
+
     private String getFullName(String schema, String table) {
         StringBuilder builder = new StringBuilder();
-        return builder.append('`')
-            .append(schema)
-            .append('`')
-            .append('.')
-            .append('`')
-            .append(table)
-            .append('`')
-            .toString();
+        return builder.append(structureSchema(schema)).append('.').append('`').append(StringUtils.replace(table,"`","``")).append('`').toString();
     }
 
     public static boolean compareTableMeta(TableMeta source, TableMeta target) {

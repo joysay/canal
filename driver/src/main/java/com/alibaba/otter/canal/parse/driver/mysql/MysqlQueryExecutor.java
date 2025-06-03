@@ -64,7 +64,7 @@ public class MysqlQueryExecutor {
         ResultSetHeaderPacket rsHeader = new ResultSetHeaderPacket();
         rsHeader.fromBytes(body);
 
-        List<FieldPacket> fields = new ArrayList<FieldPacket>();
+        List<FieldPacket> fields = new ArrayList<>();
         for (int i = 0; i < rsHeader.getColumnCount(); i++) {
             FieldPacket fp = new FieldPacket();
             fp.fromBytes(readNextPacket());
@@ -73,7 +73,7 @@ public class MysqlQueryExecutor {
 
         readEofPacket();
 
-        List<RowDataPacket> rowData = new ArrayList<RowDataPacket>();
+        List<RowDataPacket> rowData = new ArrayList<>();
         while (true) {
             body = readNextPacket();
             if (body[0] == -2) {
@@ -99,7 +99,7 @@ public class MysqlQueryExecutor {
         cmd.setQueryString(queryString);
         byte[] bodyBytes = cmd.toBytes();
         PacketManager.writeBody(channel, bodyBytes);
-        List<ResultSetPacket> resultSets = new ArrayList<ResultSetPacket>();
+        List<ResultSetPacket> resultSets = new ArrayList<>();
         boolean moreResult = true;
         while (moreResult) {
             byte[] body = readNextPacket();
@@ -112,19 +112,21 @@ public class MysqlQueryExecutor {
             ResultSetHeaderPacket rsHeader = new ResultSetHeaderPacket();
             rsHeader.fromBytes(body);
 
-            List<FieldPacket> fields = new ArrayList<FieldPacket>();
+            List<FieldPacket> fields = new ArrayList<>();
             for (int i = 0; i < rsHeader.getColumnCount(); i++) {
                 FieldPacket fp = new FieldPacket();
                 fp.fromBytes(readNextPacket());
                 fields.add(fp);
             }
 
-            moreResult = readEofPacket();
+            readEofPacket();
 
-            List<RowDataPacket> rowData = new ArrayList<RowDataPacket>();
+            List<RowDataPacket> rowData = new ArrayList<>();
             while (true) {
                 body = readNextPacket();
                 if (body[0] == -2) {
+                    EOFPacket packet = parseEOFPacket(body);
+                    moreResult = (packet.statusFlag & 0x0008) != 0;
                     break;
                 }
                 RowDataPacket rowDataPacket = new RowDataPacket();
@@ -146,13 +148,17 @@ public class MysqlQueryExecutor {
 
     private boolean readEofPacket() throws IOException {
         byte[] eofBody = readNextPacket();
+        EOFPacket packet = parseEOFPacket(eofBody);
+        return (packet.statusFlag & 0x0008) != 0;
+    }
+
+    private EOFPacket parseEOFPacket(byte[] eofBody) throws IOException {
         EOFPacket packet = new EOFPacket();
         packet.fromBytes(eofBody);
         if (eofBody[0] != -2) {
             throw new IOException("EOF Packet is expected, but packet with field_count=" + eofBody[0] + " is found.");
         }
-
-        return (packet.statusFlag & 0x0008) != 0;
+        return packet;
     }
 
     protected byte[] readNextPacket() throws IOException {

@@ -1,5 +1,6 @@
 package com.alibaba.otter.canal.parse.inbound.mysql;
 
+import static com.alibaba.otter.canal.parse.driver.mysql.utils.GtidUtil.parseGtidSet;
 import static com.alibaba.otter.canal.parse.inbound.mysql.dbsync.DirectLogFetcher.MASTER_HEARTBEAT_PERIOD_SECONDS;
 
 import java.io.IOException;
@@ -20,13 +21,13 @@ import com.alibaba.otter.canal.parse.driver.mysql.MysqlQueryExecutor;
 import com.alibaba.otter.canal.parse.driver.mysql.MysqlUpdateExecutor;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.GTIDSet;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.HeaderPacket;
-import com.alibaba.otter.canal.parse.driver.mysql.packets.MysqlGTIDSet;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.client.BinlogDumpCommandPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.client.BinlogDumpGTIDCommandPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.client.RegisterSlaveCommandPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.client.SemiAckCommandPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.server.ErrorPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.server.ResultSetPacket;
+import com.alibaba.otter.canal.parse.driver.mysql.ssl.SslInfo;
 import com.alibaba.otter.canal.parse.driver.mysql.utils.PacketManager;
 import com.alibaba.otter.canal.parse.exception.CanalParseException;
 import com.alibaba.otter.canal.parse.inbound.ErosaConnection;
@@ -42,21 +43,22 @@ import com.taobao.tddl.dbsync.binlog.event.FormatDescriptionLogEvent;
 
 public class MysqlConnection implements ErosaConnection {
 
-    private static final Logger logger         = LoggerFactory.getLogger(MysqlConnection.class);
+    private static final Logger logger             = LoggerFactory.getLogger(MysqlConnection.class);
 
     private MysqlConnector      connector;
     private long                slaveId;
-    private Charset             charset        = Charset.forName("UTF-8");
+    private Charset             charset            = Charset.forName("UTF-8");
     private BinlogFormat        binlogFormat;
     private BinlogImage         binlogImage;
 
     // tsdb releated
     private AuthenticationInfo  authInfo;
-    protected int               connTimeout    = 5 * 1000;                                      // 5秒
-    protected int               soTimeout      = 60 * 60 * 1000;                                // 1小时
-    private int                 binlogChecksum = LogEvent.BINLOG_CHECKSUM_ALG_OFF;
+    protected int               connTimeout        = 5 * 1000;                                      // 5秒
+    protected int               soTimeout          = 60 * 60 * 1000;                                // 1小时
+    private int                 binlogChecksum     = LogEvent.BINLOG_CHECKSUM_ALG_OFF;
     // dump binlog bytes, 暂不包括meta与TSDB
     private AtomicLong          receivedBinlogBytes;
+    private boolean             compatiablePercona = false;
 
     public MysqlConnection(){
     }
@@ -72,14 +74,27 @@ public class MysqlConnection implements ErosaConnection {
         connector.setConnTimeout(connTimeout);
     }
 
-    public MysqlConnection(InetSocketAddress address, String username, String password, byte charsetNumber,
-                           String defaultSchema){
+    public MysqlConnection(InetSocketAddress address, String username, String password, String defaultSchema){
         authInfo = new AuthenticationInfo();
         authInfo.setAddress(address);
         authInfo.setUsername(username);
         authInfo.setPassword(password);
         authInfo.setDefaultDatabaseName(defaultSchema);
-        connector = new MysqlConnector(address, username, password, charsetNumber, defaultSchema);
+        connector = new MysqlConnector(address, username, password, defaultSchema);
+        // 将connection里面的参数透传下
+        connector.setSoTimeout(soTimeout);
+        connector.setConnTimeout(connTimeout);
+    }
+
+    public MysqlConnection(InetSocketAddress address, String username, String password, String defaultSchema,
+                           SslInfo sslInfo){
+        authInfo = new AuthenticationInfo();
+        authInfo.setAddress(address);
+        authInfo.setUsername(username);
+        authInfo.setPassword(password);
+        authInfo.setDefaultDatabaseName(defaultSchema);
+        authInfo.setSslInfo(sslInfo);
+        connector = new MysqlConnector(address, username, password, defaultSchema, sslInfo);
         // 将connection里面的参数透传下
         connector.setSoTimeout(soTimeout);
         connector.setConnTimeout(connTimeout);
@@ -122,6 +137,7 @@ public class MysqlConnection implements ErosaConnection {
     public void seek(String binlogfilename, Long binlogPosition, String gtid, SinkFunction func) throws IOException {
         updateSettings();
         loadBinlogChecksum();
+        loadVersionComment();
         sendBinlogDump(binlogfilename, binlogPosition);
         DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
         fetcher.start(connector.getChannel());
@@ -137,9 +153,16 @@ public class MysqlConnection implements ErosaConnection {
         // 'errno = 1236, sqlstate = HY000 errmsg = The slave is connecting
         // using CHANGE MASTER TO MASTER_AUTO_POSITION = 1 ...
         if (StringUtils.isNotEmpty(gtid)) {
-            decoder.handle(LogEvent.GTID_LOG_EVENT);
-            context.setGtidSet(MysqlGTIDSet.parse(gtid));
+            GTIDSet gtidSet = parseGtidSet(gtid, isMariaDB());
+            if (isMariaDB()) {
+                decoder.handle(LogEvent.GTID_EVENT);
+                decoder.handle(LogEvent.GTID_LIST_EVENT);
+            } else {
+                decoder.handle(LogEvent.GTID_LOG_EVENT);
+            }
+            context.setGtidSet(gtidSet);
         }
+        context.setCompatiablePercona(compatiablePercona);
         context.setFormatDescription(new FormatDescriptionLogEvent(4, binlogChecksum));
         while (fetcher.fetch()) {
             accumulateReceivedBytes(fetcher.limit());
@@ -159,12 +182,14 @@ public class MysqlConnection implements ErosaConnection {
     public void dump(String binlogfilename, Long binlogPosition, SinkFunction func) throws IOException {
         updateSettings();
         loadBinlogChecksum();
+        loadVersionComment();
         sendRegisterSlave();
         sendBinlogDump(binlogfilename, binlogPosition);
         DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
         fetcher.start(connector.getChannel());
         LogDecoder decoder = new LogDecoder(LogEvent.UNKNOWN_EVENT, LogEvent.ENUM_END_EVENT);
         LogContext context = new LogContext();
+        context.setCompatiablePercona(compatiablePercona);
         context.setFormatDescription(new FormatDescriptionLogEvent(4, binlogChecksum));
         while (fetcher.fetch()) {
             accumulateReceivedBytes(fetcher.limit());
@@ -189,13 +214,14 @@ public class MysqlConnection implements ErosaConnection {
     public void dump(GTIDSet gtidSet, SinkFunction func) throws IOException {
         updateSettings();
         loadBinlogChecksum();
+        loadVersionComment();
         sendBinlogDumpGTID(gtidSet);
 
-        DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
-        try {
+        try (DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize())) {
             fetcher.start(connector.getChannel());
             LogDecoder decoder = new LogDecoder(LogEvent.UNKNOWN_EVENT, LogEvent.ENUM_END_EVENT);
             LogContext context = new LogContext();
+            context.setCompatiablePercona(compatiablePercona);
             context.setFormatDescription(new FormatDescriptionLogEvent(4, binlogChecksum));
             // fix bug: #890 将gtid传输至context中，供decode使用
             context.setGtidSet(gtidSet);
@@ -208,12 +234,20 @@ public class MysqlConnection implements ErosaConnection {
                     throw new CanalParseException("parse failed");
                 }
 
-                if (!func.sink(event)) {
-                    break;
+                List<LogEvent> iterateEvents = decoder.processIterateDecode(event, context);
+                if (!iterateEvents.isEmpty()) {
+                    // 处理compress event
+                    for (LogEvent itEvent : iterateEvents) {
+                        if (!func.sink(event)) {
+                            break;
+                        }
+                    }
+                } else {
+                    if (!func.sink(event)) {
+                        break;
+                    }
                 }
             }
-        } finally {
-            fetcher.close();
         }
     }
 
@@ -225,12 +259,13 @@ public class MysqlConnection implements ErosaConnection {
     public void dump(String binlogfilename, Long binlogPosition, MultiStageCoprocessor coprocessor) throws IOException {
         updateSettings();
         loadBinlogChecksum();
+        loadVersionComment();
         sendRegisterSlave();
         sendBinlogDump(binlogfilename, binlogPosition);
         ((MysqlMultiStageCoprocessor) coprocessor).setConnection(this);
         ((MysqlMultiStageCoprocessor) coprocessor).setBinlogChecksum(binlogChecksum);
-        DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
-        try {
+        ((MysqlMultiStageCoprocessor) coprocessor).setCompatiablePercona(compatiablePercona);
+        try (DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize())) {
             fetcher.start(connector.getChannel());
             while (fetcher.fetch()) {
                 accumulateReceivedBytes(fetcher.limit());
@@ -240,8 +275,6 @@ public class MysqlConnection implements ErosaConnection {
                     break;
                 }
             }
-        } finally {
-            fetcher.close();
         }
     }
 
@@ -254,11 +287,12 @@ public class MysqlConnection implements ErosaConnection {
     public void dump(GTIDSet gtidSet, MultiStageCoprocessor coprocessor) throws IOException {
         updateSettings();
         loadBinlogChecksum();
+        loadVersionComment();
         sendBinlogDumpGTID(gtidSet);
         ((MysqlMultiStageCoprocessor) coprocessor).setConnection(this);
         ((MysqlMultiStageCoprocessor) coprocessor).setBinlogChecksum(binlogChecksum);
-        DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize());
-        try {
+        ((MysqlMultiStageCoprocessor) coprocessor).setCompatiablePercona(compatiablePercona);
+        try (DirectLogFetcher fetcher = new DirectLogFetcher(connector.getReceiveBufferSize())) {
             fetcher.start(connector.getChannel());
             while (fetcher.fetch()) {
                 accumulateReceivedBytes(fetcher.limit());
@@ -268,8 +302,6 @@ public class MysqlConnection implements ErosaConnection {
                     break;
                 }
             }
-        } finally {
-            fetcher.close();
         }
     }
 
@@ -306,7 +338,7 @@ public class MysqlConnection implements ErosaConnection {
                 err.fromBytes(body);
                 throw new IOException("Error When doing Register slave:" + err.toString());
             } else {
-                throw new IOException("unpexpected packet with field_count=" + body[0]);
+                throw new IOException("Unexpected packet with field_count=" + body[0]);
             }
         }
     }
@@ -341,6 +373,14 @@ public class MysqlConnection implements ErosaConnection {
     }
 
     private void sendBinlogDumpGTID(GTIDSet gtidSet) throws IOException {
+        if (isMariaDB()) {
+            sendMariaBinlogDumpGTID(gtidSet);
+        } else {
+            sendMySQLBinlogDumpGTID(gtidSet);
+        }
+    }
+
+    private void sendMySQLBinlogDumpGTID(GTIDSet gtidSet) throws IOException {
         BinlogDumpGTIDCommandPacket binlogDumpCmd = new BinlogDumpGTIDCommandPacket();
         binlogDumpCmd.slaveServerId = this.slaveId;
         binlogDumpCmd.gtidSet = gtidSet;
@@ -351,6 +391,15 @@ public class MysqlConnection implements ErosaConnection {
         binlogDumpHeader.setPacketBodyLength(cmdBody.length);
         binlogDumpHeader.setPacketSequenceNumber((byte) 0x00);
         PacketManager.writePkg(connector.getChannel(), binlogDumpHeader.toBytes(), cmdBody);
+        connector.setDumping(true);
+    }
+
+    private void sendMariaBinlogDumpGTID(GTIDSet gtidSet) throws IOException {
+        update("SET @slave_connect_state = '" + new String(gtidSet.encode()) + "'");
+        update("SET @slave_gtid_strict_mode = 0");
+        update("SET @slave_gtid_ignore_duplicates = 0");
+        sendRegisterSlave();
+        sendBinlogDump("", 0L);
         connector.setDumping(true);
     }
 
@@ -393,13 +442,13 @@ public class MysqlConnection implements ErosaConnection {
             logger.warn("update wait_timeout failed", e);
         }
         try {
-            update("set net_write_timeout=1800");
+            update("set net_write_timeout=7200");
         } catch (Exception e) {
             logger.warn("update net_write_timeout failed", e);
         }
 
         try {
-            update("set net_read_timeout=1800");
+            update("set net_read_timeout=7200");
         } catch (Exception e) {
             logger.warn("update net_read_timeout failed", e);
         }
@@ -429,7 +478,8 @@ public class MysqlConnection implements ErosaConnection {
             // mysql5.6需要设置slave_uuid避免被server kill链接
             update("set @slave_uuid=uuid()");
         } catch (Exception e) {
-            if (!StringUtils.contains(e.getMessage(), "Unknown system variable")) {
+            if (!StringUtils.contains(e.getMessage(), "Unknown system variable")
+                && !StringUtils.contains(e.getMessage(), "slave_uuid can't be set")) {
                 logger.warn("update slave_uuid failed", e);
             }
         }
@@ -444,13 +494,13 @@ public class MysqlConnection implements ErosaConnection {
         }
 
         /**
-         * MASTER_HEARTBEAT_PERIOD sets the interval in seconds between
-         * replication heartbeats. Whenever the master's binary log is updated
-         * with an event, the waiting period for the next heartbeat is reset.
-         * interval is a decimal value having the range 0 to 4294967 seconds and
-         * a resolution in milliseconds; the smallest nonzero value is 0.001.
-         * Heartbeats are sent by the master only if there are no unsent events
-         * in the binary log file for a period longer than interval.
+         * MASTER_HEARTBEAT_PERIOD sets the interval in seconds between replication
+         * heartbeats. Whenever the master's binary log is updated with an event, the
+         * waiting period for the next heartbeat is reset. interval is a decimal value
+         * having the range 0 to 4294967 seconds and a resolution in milliseconds; the
+         * smallest nonzero value is 0.001. Heartbeats are sent by the master only if
+         * there are no unsent events in the binary log file for a period longer than
+         * interval.
          */
         try {
             long periodNano = TimeUnit.SECONDS.toNanos(MASTER_HEARTBEAT_PERIOD_SECONDS);
@@ -473,7 +523,8 @@ public class MysqlConnection implements ErosaConnection {
 
         List<String> columnValues = rs.getFieldValues();
         if (columnValues == null || columnValues.size() != 2) {
-            logger.warn("unexpected binlog format query result, this may cause unexpected result, so throw exception to request network to io shutdown.");
+            logger.warn(
+                "unexpected binlog format query result, this may cause unexpected result, so throw exception to request network to io shutdown.");
             throw new IllegalStateException("unexpected binlog format query result:" + rs.getFieldValues());
         }
 
@@ -533,6 +584,51 @@ public class MysqlConnection implements ErosaConnection {
         }
     }
 
+    /**
+     * 识别下mysql的几种生态版本 (percona / mariadb / mysql)
+     */
+    private void loadVersionComment() {
+        ResultSetPacket rs = null;
+        try {
+            rs = query("select @@version_comment");
+            List<String> columnValues = rs.getFieldValues();
+            if (columnValues != null && columnValues.size() >= 1 && columnValues.get(0) != null) {
+                logger.warn("load MySQL @@version_comment : " + columnValues.get(0));
+                if (StringUtils.containsIgnoreCase(columnValues.get(0), "Percona")) {
+                    compatiablePercona = true;
+                }
+            }
+        } catch (Throwable e) {
+            compatiablePercona = false;
+        }
+    }
+
+    /**
+     * MySQL 8.4版本开始部分命令出现变化
+     * https://dev.mysql.com/doc/relnotes/mysql/8.4/en/news-8-4-0.html#mysqld-8-4-0-deprecation-removal
+     * 
+     * @param major
+     * @param minor
+     * @return
+     */
+    public boolean atLeast(int major, int minor) {
+        if (isMariaDB()) {
+            return false;
+        }
+        String version = connector.getServerVersion();
+        if (StringUtils.isNotEmpty(version)) {
+            String[] parts = version.split("\\.");
+            int majorVer = Integer.parseInt(parts[0]);
+            int minorVer = Integer.parseInt(parts[1]);
+            return (majorVer > major) || (majorVer == major && minorVer >= minor);
+        }
+        return false;
+    }
+
+    public boolean atLeastMySQL84() {
+        return atLeast(8, 4);
+    }
+
     private void accumulateReceivedBytes(long x) {
         if (receivedBinlogBytes != null) {
             receivedBinlogBytes.addAndGet(x);
@@ -557,7 +653,7 @@ public class MysqlConnection implements ErosaConnection {
 
         private String value;
 
-        private BinlogFormat(String value){
+        private BinlogFormat(String value) {
             this.value = value;
         }
 
@@ -597,7 +693,7 @@ public class MysqlConnection implements ErosaConnection {
 
         private String value;
 
-        private BinlogImage(String value){
+        private BinlogImage(String value) {
             this.value = value;
         }
 
@@ -680,6 +776,10 @@ public class MysqlConnection implements ErosaConnection {
 
     public void setReceivedBinlogBytes(AtomicLong receivedBinlogBytes) {
         this.receivedBinlogBytes = receivedBinlogBytes;
+    }
+
+    public boolean isMariaDB() {
+        return connector.getServerVersion() != null && connector.getServerVersion().toLowerCase().contains("mariadb");
     }
 
 }

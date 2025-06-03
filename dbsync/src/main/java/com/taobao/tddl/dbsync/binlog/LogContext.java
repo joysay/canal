@@ -5,7 +5,6 @@ import java.util.Map;
 
 import com.alibaba.otter.canal.parse.driver.mysql.packets.GTIDSet;
 import com.taobao.tddl.dbsync.binlog.event.FormatDescriptionLogEvent;
-import com.taobao.tddl.dbsync.binlog.event.GtidLogEvent;
 import com.taobao.tddl.dbsync.binlog.event.TableMapLogEvent;
 
 /**
@@ -16,7 +15,7 @@ import com.taobao.tddl.dbsync.binlog.event.TableMapLogEvent;
  */
 public final class LogContext {
 
-    private final Map<Long, TableMapLogEvent> mapOfTable = new HashMap<Long, TableMapLogEvent>();
+    private final Map<Long, TableMapLogEvent> mapOfTable = new HashMap<>();
 
     private FormatDescriptionLogEvent         formatDescription;
 
@@ -24,7 +23,11 @@ public final class LogContext {
 
     private GTIDSet                           gtidSet;
 
-    private GtidLogEvent                      gtidLogEvent; // save current gtid log event
+    private LogEvent                          gtidLogEvent; // save current gtid log event
+
+    private boolean                           iterateDecode = false;
+
+    private boolean                           compatiablePercona = false;
 
     public LogContext(){
         this.formatDescription = FormatDescriptionLogEvent.FORMAT_DESCRIPTION_EVENT_5_x;
@@ -75,11 +78,27 @@ public final class LogContext {
         this.gtidSet = gtidSet;
     }
 
-    public GtidLogEvent getGtidLogEvent() {
+    public LogEvent getGtidLogEvent() {
         return gtidLogEvent;
     }
 
-    public void setGtidLogEvent(GtidLogEvent gtidLogEvent) {
+    public void setGtidLogEvent(LogEvent gtidLogEvent) {
         this.gtidLogEvent = gtidLogEvent;
+    }
+
+    public boolean isIterateDecode() {
+        return iterateDecode;
+    }
+
+    public void setIterateDecode(boolean iterateDecode) {
+        this.iterateDecode = iterateDecode;
+    }
+
+    public boolean isCompatiablePercona() {
+        return compatiablePercona;
+    }
+
+    public void setCompatiablePercona(boolean compatiablePercona) {
+        this.compatiablePercona = compatiablePercona;
     }
 }

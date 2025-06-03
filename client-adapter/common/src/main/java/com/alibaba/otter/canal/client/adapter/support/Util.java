@@ -16,6 +16,7 @@ import java.util.function.Function;
 
 import javax.sql.DataSource;
 
+import com.alibaba.druid.pool.DruidDataSource;
 import org.apache.commons.lang.StringUtils;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
@@ -28,7 +29,9 @@ import com.google.common.cache.LoadingCache;
 
 public class Util {
 
-    private static final Logger logger = LoggerFactory.getLogger(Util.class);
+    private static final Logger logger                = LoggerFactory.getLogger(Util.class);
+
+    public static final String  AUTO_GENERATED_PREFIX = "AUTO_GENERATED_";
 
     /**
      * 通过DS执行sql
@@ -36,7 +39,15 @@ public class Util {
     public static Object sqlRS(DataSource ds, String sql, Function<ResultSet, Object> fun) {
         try (Connection conn = ds.getConnection();
                 Statement stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
-            stmt.setFetchSize(Integer.MIN_VALUE);
+
+            DruidDataSource druidDataSource = (DruidDataSource) ds;
+            if ("postgresql".equals(druidDataSource.getDbType())) {
+                conn.setAutoCommit(false);
+                stmt.setFetchSize(1000);
+            } else {
+                stmt.setFetchSize(Integer.MIN_VALUE);
+            }
+
             try (ResultSet rs = stmt.executeQuery(sql)) {
                 return fun.apply(rs);
             }
@@ -50,7 +61,13 @@ public class Util {
         try (Connection conn = ds.getConnection()) {
             try (PreparedStatement pstmt = conn
                 .prepareStatement(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
-                pstmt.setFetchSize(Integer.MIN_VALUE);
+                DruidDataSource druidDataSource = (DruidDataSource) ds;
+                if ("postgresql".equals(druidDataSource.getDbType())) {
+                    conn.setAutoCommit(false);
+                    pstmt.setFetchSize(1000);
+                } else {
+                    pstmt.setFetchSize(Integer.MIN_VALUE);
+                }
                 if (values != null) {
                     for (int i = 0; i < values.size(); i++) {
                         pstmt.setObject(i + 1, values.get(i));
@@ -163,39 +180,38 @@ public class Util {
 
     public static ThreadPoolExecutor newFixedDaemonThreadPool(int nThreads, long keepAliveTime) {
         return new ThreadPoolExecutor(nThreads,
-                nThreads,
-                keepAliveTime,
-                TimeUnit.MILLISECONDS,
-                new SynchronousQueue<>(),
-                DaemonThreadFactory.daemonThreadFactory,
-                (r, exe) -> {
-                    if (!exe.isShutdown()) {
-                        try {
-                            exe.getQueue().put(r);
-                        } catch (InterruptedException e) {
-                            // ignore
-                        }
+            nThreads,
+            keepAliveTime,
+            TimeUnit.MILLISECONDS,
+            new SynchronousQueue<>(),
+            DaemonThreadFactory.daemonThreadFactory,
+            (r, exe) -> {
+                if (!exe.isShutdown()) {
+                    try {
+                        exe.getQueue().put(r);
+                    } catch (InterruptedException e) {
+                        // ignore
                     }
                 }
-        );
+            });
     }
 
     public static ThreadPoolExecutor newSingleDaemonThreadExecutor(long keepAliveTime) {
         return new ThreadPoolExecutor(1,
-                1,
-                keepAliveTime,
-                TimeUnit.MILLISECONDS,
-                new SynchronousQueue<>(),
-                DaemonThreadFactory.daemonThreadFactory,
-                (r, exe) -> {
-                    if (!exe.isShutdown()) {
-                        try {
-                            exe.getQueue().put(r);
-                        } catch (InterruptedException e) {
-                            // ignore
-                        }
+            1,
+            keepAliveTime,
+            TimeUnit.MILLISECONDS,
+            new SynchronousQueue<>(),
+            DaemonThreadFactory.daemonThreadFactory,
+            (r, exe) -> {
+                if (!exe.isShutdown()) {
+                    try {
+                        exe.getQueue().put(r);
+                    } catch (InterruptedException e) {
+                        // ignore
                     }
-                });
+                }
+            });
     }
 
     public final static String  timeZone;    // 当前时区
@@ -325,4 +341,56 @@ public class Util {
 
         return null;
     }
+
+    /**
+     * Check if the time string has millisecond or microsecond units
+     * 
+     * @param timeStr time string
+     * @return boolean
+     */
+    public static boolean isAccuracyOverSecond(String timeStr) {
+        if (StringUtils.isEmpty(timeStr)) {
+            return false;
+        }
+        String[] times = StringUtils.split(timeStr, ".");
+        return times.length > 1 && !times[times.length - 1].isEmpty();
+    }
+
+    /**
+     * Check if the datetime string has microsecond or nanosecond units
+     * 
+     * @param datetimeStr datetime string
+     * @return boolean
+     */
+    public static boolean isAccuracyOverMillisecond(String datetimeStr) {
+        if (StringUtils.isEmpty(datetimeStr)) {
+            return false;
+        }
+        String[] times = StringUtils.split(datetimeStr, ".");
+        return times.length > 1 && times[times.length - 1].length() > 3;
+    }
+
+    /**
+     * MySQL has fractional seconds support for TIME, DATETIME, and TIMESTAMP
+     * values, with up to microseconds (6 digits) precision. ISO-8601 standard
+     * format is with up to nanoseconds (9 digits) precision, which is sufficient
+     * for storing MySQL time-related data.
+     * 
+     * @param datetimeStr datetime string
+     * @return LocalDateTime
+     */
+    public static LocalDateTime parseISOLocalDateTime(String datetimeStr) {
+        if (StringUtils.isEmpty(datetimeStr)) {
+            return null;
+        }
+        datetimeStr = datetimeStr.trim();
+        try {
+            // Replace SPACE in middle with `T` to comply with ISO-8601 standard format
+            return LocalDateTime.parse(datetimeStr.replace(" ", "T"));
+        } catch (Exception e) {
+            logger.error("Convert datetime string to ISOLocalDateTime fail:{}", datetimeStr, e);
+        }
+        return null;
+    }
+
 }

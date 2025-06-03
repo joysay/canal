@@ -2,11 +2,7 @@ package com.alibaba.otter.canal.client.adapter.kudu.service;
 
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 
 import javax.sql.DataSource;
@@ -45,13 +41,13 @@ public class KuduEtlService extends AbstractEtlService {
         boolean flag = kuduTemplate.tableExists(kuduMapping.getTargetTable());
         // 表不存在，停止导入
         if (!flag) {
-            logger.info("{} is don't hava,please check your kudu table !", kuduMapping.getTargetTable());
+            logger.info("{} is don't exist , please check your kudu table !", kuduMapping.getTargetTable());
             errMsg.add(kuduMapping.getTargetTable() + " is don't hava,please check your kudu table !");
             etlResult.setErrorMessage(Joiner.on("\n").join(errMsg));
             return etlResult;
         }
         logger.info("{} etl is starting!", kuduMapping.getTargetTable());
-        String sql = "SELECT * FROM " + kuduMapping.getDatabase() + "." + kuduMapping.getTable();
+        String sql = "SELECT * FROM " + SyncUtil.getDbTableName(kuduMapping);
         return importData(sql, params);
     }
 
@@ -88,45 +84,40 @@ public class KuduEtlService extends AbstractEtlService {
                         Map<String, Object> data = new HashMap<>();
                         for (Map.Entry<String, String> entry : columnsMap.entrySet()) {
                             String mysqlColumnName = entry.getKey();// mysql字段名
-                String kuduColumnName = entry.getValue();// kudu字段名
-                if (kuduColumnName == null) {
-                    kuduColumnName = mysqlColumnName;
-                }
-                Object value = rs.getObject(kuduColumnName);
-                if (value != null) {
-                    data.put(kuduColumnName, value);
-                } else {
-                    data.put(kuduColumnName, null);
-                }
-            }
-            dataList.add(data);
-            idx++;
-            impCount.incrementAndGet();
-            if (logger.isDebugEnabled()) {
-                logger.debug("successful import count:" + impCount.get());
-            }
-            if (idx % kuduMapping.getCommitBatch() == 0) {
-                kuduTemplate.upsert(kuduMapping.getTargetTable(), dataList);
-                dataList.clear();
-            }
-        }
-        if (!dataList.isEmpty()) {
-            kuduTemplate.upsert(kuduMapping.getTargetTable(), dataList);
-        }
-        return true;
+                            String kuduColumnName = entry.getValue();// kudu字段名
+                            if (kuduColumnName == null) {
+                                kuduColumnName = mysqlColumnName;
+                            }
+                            Object value = rs.getObject(kuduColumnName);
+                            if (value != null) {
+                                data.put(kuduColumnName, value);
+                            } else {
+                                data.put(kuduColumnName, null);
+                            }
+                        }
+                        dataList.add(data);
+                        idx++;
+                        impCount.incrementAndGet();
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("successful import count:" + impCount.get());
+                        }
+                        if (idx % kuduMapping.getCommitBatch() == 0) {
+                            kuduTemplate.upsert(kuduMapping.getTargetTable(), dataList);
+                            dataList.clear();
+                        }
+                    }
+                    if (!dataList.isEmpty()) {
+                        kuduTemplate.upsert(kuduMapping.getTargetTable(), dataList);
+                    }
+                    return true;
 
-    } catch (SQLException e) {
-        e.printStackTrace();
-        logger.error(kuduMapping.getTargetTable() + " etl failed! ==>" + e.getMessage(), e);
-        errMsg.add(kuduMapping.getTargetTable() + " etl failed! ==>" + e.getMessage());
-        return false;
-    } catch (KuduException e) {
-        e.printStackTrace();
-        logger.error(kuduMapping.getTargetTable() + " etl failed! ==>" + e.getMessage(), e);
-        errMsg.add(kuduMapping.getTargetTable() + " etl failed! ==>" + e.getMessage());
-        return false;
-    }
-}           );
+                } catch (SQLException | KuduException e) {
+                    e.printStackTrace();
+                    logger.error(kuduMapping.getTargetTable() + " etl failed! ==>" + e.getMessage(), e);
+                    errMsg.add(kuduMapping.getTargetTable() + " etl failed! ==>" + e.getMessage());
+                    return false;
+                }
+            });
             return true;
         } catch (Exception e) {
             logger.error(e.getMessage(), e);

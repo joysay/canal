@@ -4,39 +4,38 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import com.alibaba.polardbx.druid.sql.SQLUtils;
+import com.alibaba.polardbx.druid.sql.ast.SQLExpr;
+import com.alibaba.polardbx.druid.sql.ast.SQLStatement;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLIdentifierExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLPropertyExpr;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableAddConstraint;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableAddIndex;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableDropConstraint;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableDropIndex;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableDropKey;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableItem;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableRename;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLConstraint;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLCreateDatabaseStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLCreateIndexStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLCreateTableStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLDeleteStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLDropDatabaseStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLDropIndexStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLDropTableStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLExprTableSource;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLInsertStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLTableSource;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLTruncateStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLUnique;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLUpdateStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlRenameTableStatement;
+import com.alibaba.polardbx.druid.sql.parser.ParserException;
+import com.alibaba.polardbx.druid.util.JdbcConstants;
 import org.apache.commons.lang.StringUtils;
 
-import com.alibaba.fastsql.sql.SQLUtils;
-import com.alibaba.fastsql.sql.ast.SQLExpr;
-import com.alibaba.fastsql.sql.ast.SQLStatement;
-import com.alibaba.fastsql.sql.ast.expr.SQLIdentifierExpr;
-import com.alibaba.fastsql.sql.ast.expr.SQLPropertyExpr;
-import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableAddConstraint;
-import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableAddIndex;
-import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableDropConstraint;
-import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableDropIndex;
-import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableDropKey;
-import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableItem;
-import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableRename;
-import com.alibaba.fastsql.sql.ast.statement.SQLAlterTableStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLConstraint;
-import com.alibaba.fastsql.sql.ast.statement.SQLCreateDatabaseStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLCreateIndexStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLCreateTableStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLDeleteStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLDropDatabaseStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLDropIndexStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLDropTableStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLExprTableSource;
-import com.alibaba.fastsql.sql.ast.statement.SQLInsertStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLTableSource;
-import com.alibaba.fastsql.sql.ast.statement.SQLTruncateStatement;
-import com.alibaba.fastsql.sql.ast.statement.SQLUnique;
-import com.alibaba.fastsql.sql.ast.statement.SQLUpdateStatement;
-import com.alibaba.fastsql.sql.dialect.mysql.ast.statement.MySqlRenameTableStatement;
-import com.alibaba.fastsql.sql.dialect.mysql.ast.statement.MySqlRenameTableStatement.Item;
-import com.alibaba.fastsql.sql.parser.ParserException;
-import com.alibaba.fastsql.util.JdbcConstants;
 import com.alibaba.otter.canal.protocol.CanalEntry.EventType;
 
 /**
@@ -56,7 +55,7 @@ public class DruidDdlParser {
             return Arrays.asList(ddlResult);
         }
 
-        List<DdlResult> ddlResults = new ArrayList<DdlResult>();
+        List<DdlResult> ddlResults = new ArrayList<>();
         for (SQLStatement statement : stmtList) {
             if (statement instanceof SQLCreateTableStatement) {
                 DdlResult ddlResult = new DdlResult();
@@ -66,6 +65,12 @@ public class DruidDdlParser {
                 ddlResults.add(ddlResult);
             } else if (statement instanceof SQLAlterTableStatement) {
                 SQLAlterTableStatement alterTable = (SQLAlterTableStatement) statement;
+                if (alterTable.getTableOptions().size() > 0) {
+                    DdlResult ddlResult = new DdlResult();
+                    processName(ddlResult, schmeaName, alterTable.getName(), false);
+                    ddlResult.setType(EventType.ALTER);
+                    ddlResults.add(ddlResult);
+                }
                 for (SQLAlterTableItem item : alterTable.getItems()) {
                     if (item instanceof SQLAlterTableRename) {
                         DdlResult ddlResult = new DdlResult();
@@ -135,7 +140,7 @@ public class DruidDdlParser {
                 }
             } else if (statement instanceof MySqlRenameTableStatement) {
                 MySqlRenameTableStatement rename = (MySqlRenameTableStatement) statement;
-                for (Item item : rename.getItems()) {
+                for (MySqlRenameTableStatement.Item item : rename.getItems()) {
                     DdlResult ddlResult = new DdlResult();
                     processName(ddlResult, schmeaName, item.getName(), true);
                     processName(ddlResult, schmeaName, item.getTo(), false);
